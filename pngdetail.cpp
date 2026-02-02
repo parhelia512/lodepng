@@ -655,8 +655,13 @@ void displayPalettePixels(const std::vector<unsigned char>& buffer, const Option
   std::cout << (options.use_hex ? std::hex: std::dec);
 
   state.decoder.color_convert = 0;
+  state.decoder.ignore_crc = 1;
+  state.decoder.zlibsettings.ignore_adler32 = 1;
+  state.decoder.ignore_critical = 1;
+  state.decoder.ignore_end = 1;
 
-  lodepng::decode(out, w, h, state, buffer);
+  unsigned error = lodepng::decode(out, w, h, state, buffer);
+  if(error) return;
 
   if(state.info_png.color.colortype == LCT_PALETTE) {
     if (options.show_color_stats) {
@@ -1041,7 +1046,7 @@ void showHex(const unsigned char* data, size_t size, const Options& options) {
 
 void showHeaderInfo(Data& data, const Options& options) {
   data.loadInspect();
-  if(data.error) return;
+  if(data.error && data.error != 57) return; // CRC error (57) ignored here for parsing of header only
   std::cout << (options.use_hex ? std::hex: std::dec);
 
   const LodePNGInfo& info = data.state.info_png;
@@ -1259,122 +1264,151 @@ uint32_t readExifUint16(const unsigned char* exif, size_t size, size_t pos, bool
 }
 
 
-// shows all the information from 1 IFD from the exif file. If more IFDs are linked, recursively shows those too.
-void showExifIFD(const unsigned char* exif, size_t size, size_t ifd_pos, bool big_endian, bool is_thumbnail, bool is_sub) {
-  size_t pos = ifd_pos;
-  size_t sub_ifd = 0;
-  if(pos + 2 > size) {
-    std::cout << "EXIF IFD out of range: " << pos << std::endl;
-    return;
-  }
-  size_t num_entries = readExifUint16(exif, size, pos, big_endian);
-  if(is_sub) {
-    std::cout << "EXIF Sub-IFD at " << pos << ", num entries: " << num_entries << std::endl;
-  } else if(is_thumbnail) {
-    std::cout << "EXIF Thumbnail IFD at " << pos << ", num entries: " << num_entries << std::endl;
-  } else {
-    std::cout << "EXIF IFD at " << pos << ", num entries: " << num_entries << std::endl;
-  }
-  pos += 2;
-  for(size_t i = 0; i < num_entries; i++) {
-    if(pos + 12 > size) {
-      std::cout << "EXIF IFD entry out of range: " << pos << std::endl;
-      return;
-    }
-    uint32_t tag_number = readExifUint16(exif, size, pos, big_endian);
-    uint32_t format = readExifUint16(exif, size, pos + 2, big_endian);
-    uint32_t num = readExifUint32(exif, size, pos + 4, big_endian);
-    uint32_t offset = readExifUint32(exif, size, pos + 8, big_endian);
-    uint32_t component_size = 1;
-    if(format == 3 || format == 8) component_size = 2;
-    else if(format == 4 || format == 9 || format == 11) component_size = 4;
-    else if(format == 5 || format == 10 || format == 12) component_size = 8;
-    size_t len = num * component_size;
-    if(len <= 4) offset = pos + 8; // small value is stored in the offset itself
-    pos += 12;
+// shows all the information from 1 Image File Directory (IDF) from the exif file. If more IFDs are linked, recursively shows those too.
+void showExifIFD(const unsigned char* exif, size_t size, size_t ifd_pos, bool big_endian) {
+  std::map<size_t, bool> seen;
+  size_t num_ifds = 0;
+  bool is_thumbnail = false;
 
-    if(format < 1 || format > 12) {
-      std::cout << "EXIF unknown entry format" << std::endl;
-      return;
-    }
-    if(is_thumbnail) std::cout << "EXIF tag (thumbnail): ";
-    else std::cout << "EXIF tag: ";
-    // Only show some common tags by full name
-    if(tag_number == 256) std::cout << "Umage Width";
-    else if(tag_number == 257) std::cout << "Image Height";
-    else if(tag_number == 259) std::cout << "Compression";
-    else if(tag_number == 269) std::cout << "Document Name";
-    else if(tag_number == 270) std::cout << "Image Description";
-    else if(tag_number == 274) std::cout << "Orientation";
-    else if(tag_number == 282) std::cout << "X Resolution";
-    else if(tag_number == 283) std::cout << "Y Resolution";
-    else if(tag_number == 296) std::cout << "Resolution Unit";
-    else if(tag_number == 513) std::cout << "Thumbnail Offset";
-    else if(tag_number == 514) std::cout << "Thumbnail Size";
-    else if(tag_number == 33434) std::cout << "Exposure Time";
-    else if(tag_number == 33432) std::cout << "Copyright";
-    else if(tag_number == 36864) std::cout << "Exif Version";
-    else if(tag_number == 37510) std::cout << "User Comment";
-    else std::cout << "#" << tag_number; // tag for which we don't show a name here
-    std::cout << ": ";
-
-    if(offset + len > size) {
-      std::cout << "EXIF data out of range" << std::endl;
-      return;
-    }
-    if(len == 0) {
-      std::cout << "[empty]" << std::endl;
-      continue;
-    }
-
-    if(format == 1) {
-      std::cout << (uint32_t)exif[offset];
-    } else if(format == 2) {
-      for(size_t j = 0; j < len; j++) {
-        if(!exif[offset + j]) break; // NULL terminator
-        std::cout << exif[offset + j];
+  for(;;) {
+    // stack of sub-IFD's
+    std::vector<size_t> stack;
+    stack.push_back(ifd_pos);
+    seen[ifd_pos] = true;
+    bool is_sub = false;
+    size_t next_ifd = 0;
+    while(!stack.empty()) {
+      if(num_ifds++ > 16384) {
+        std::cout << "Error: Too many EXIF IFDs, bailing out" << std::endl;
+        return;
       }
-    } else if(format == 3) {
-      std::cout << readExifUint16(exif, size, offset, big_endian);
-    } else if(format == 4) {
-      if(tag_number == 34665) sub_ifd = readExifUint32(exif, size, offset, big_endian);
-      else std::cout << readExifUint32(exif, size, offset, big_endian);
-    } else if(format == 5) {
-      double n = readExifUint32(exif, size, offset, big_endian);
-      double d = readExifUint32(exif, size, offset + 4, big_endian);
-      std::cout << (n / d);
-    } else if(format == 7 && len > 8 && exif[offset + 0] == 'A' && exif[offset + 1] == 'S' &&
-              exif[offset + 2] == 'C' && exif[offset + 3] == 'I' && exif[offset + 4] == 'I') {
-      for(size_t j = 8; j < len; j++) std::cout << exif[offset + j];
-    } else if(format == 7 && len == 4 && tag_number == 36864) {
-      for(size_t j = 0; j < len; j++) std::cout << exif[offset + j];
-    } else if(format == 8) {
-      std::cout << (int32_t)readExifUint16(exif, size, offset, big_endian);
-    } else if(format == 9) {
-      std::cout << (int16_t)readExifUint32(exif, size, offset, big_endian);
-    } else if(format == 10) {
-      double n = (int32_t)readExifUint32(exif, size, offset, big_endian);
-      double d = (int32_t)readExifUint32(exif, size, offset + 4, big_endian);
-      std::cout << (n / d);
-    } else {
-      // Formats like double not handled here
-      std::cout << "[format " << format << ", len " << len << "]";
-    }
-    std::cout << std::endl;
-  }
-  if(pos + 4 > size) {
-    std::cout << "EXIF IFD footer out of range" << std::endl;
-    return;
-  }
-  size_t next_ifd = readExifUint32(exif, size, pos, big_endian);
+      size_t pos = stack.back();
+      stack.pop_back();
+      if(pos + 2 > size) {
+        std::cout << "Error: EXIF IFD out of range: " << pos << std::endl;
+        return;
+      }
+      size_t num_entries = readExifUint16(exif, size, pos, big_endian);
+      if(is_sub) {
+        std::cout << "EXIF Sub-IFD at " << pos << ", num entries: " << num_entries << std::endl;
+      } else if(is_thumbnail) {
+        std::cout << "EXIF Thumbnail IFD at " << pos << ", num entries: " << num_entries << std::endl;
+      } else {
+        std::cout << "EXIF IFD at " << pos << ", num entries: " << num_entries << std::endl;
+      }
+      pos += 2;
+      for(size_t i = 0; i < num_entries; i++) {
+        if(pos + 12 > size) {
+          std::cout << "EXIF IFD entry out of range: " << pos << std::endl;
+          return;
+        }
+        uint32_t tag_number = readExifUint16(exif, size, pos, big_endian);
+        uint32_t format = readExifUint16(exif, size, pos + 2, big_endian);
+        uint32_t num = readExifUint32(exif, size, pos + 4, big_endian);
+        uint32_t offset = readExifUint32(exif, size, pos + 8, big_endian);
+        uint32_t component_size = 1;
+        if(format == 3 || format == 8) component_size = 2;
+        else if(format == 4 || format == 9 || format == 11) component_size = 4;
+        else if(format == 5 || format == 10 || format == 12) component_size = 8;
+        size_t len = num * component_size;
+        if(len <= 4) offset = pos + 8; // small value is stored in the offset itself
+        pos += 12;
 
-  // The > checks are to guarantee progress rather than infinity recursion, though it does mean
-  // that an odd EXIF that places later parts earlier in the file won't be supported correctly
-  if(sub_ifd && sub_ifd > ifd_pos && sub_ifd != next_ifd) {
-    showExifIFD(exif, size, sub_ifd, big_endian, is_thumbnail, true);
-  }
-  if(next_ifd && next_ifd > ifd_pos) {
-    showExifIFD(exif, size, sub_ifd, big_endian, true, is_sub);
+        if(format < 1 || format > 12) {
+          std::cout << "Error: EXIF unknown entry format" << std::endl;
+          return;
+        }
+        if(is_thumbnail) std::cout << "EXIF tag (thumbnail): ";
+        else std::cout << "EXIF tag: ";
+        // Only show some common tags by full name
+        if(tag_number == 256) std::cout << "Umage Width";
+        else if(tag_number == 257) std::cout << "Image Height";
+        else if(tag_number == 259) std::cout << "Compression";
+        else if(tag_number == 269) std::cout << "Document Name";
+        else if(tag_number == 270) std::cout << "Image Description";
+        else if(tag_number == 274) std::cout << "Orientation";
+        else if(tag_number == 282) std::cout << "X Resolution";
+        else if(tag_number == 283) std::cout << "Y Resolution";
+        else if(tag_number == 296) std::cout << "Resolution Unit";
+        else if(tag_number == 513) std::cout << "Thumbnail Offset";
+        else if(tag_number == 514) std::cout << "Thumbnail Size";
+        else if(tag_number == 33434) std::cout << "Exposure Time";
+        else if(tag_number == 33432) std::cout << "Copyright";
+        else if(tag_number == 36864) std::cout << "Exif Version";
+        else if(tag_number == 37510) std::cout << "User Comment";
+        else std::cout << "#" << tag_number; // tag for which we don't show a name here
+        std::cout << ": ";
+
+        if(offset + len > size) {
+          std::cout << "Error: EXIF data out of range" << std::endl;
+          return;
+        }
+        if(len == 0) {
+          std::cout << "[empty]" << std::endl;
+          continue;
+        }
+
+        if(format == 1) {
+          std::cout << (uint32_t)exif[offset];
+        } else if(format == 2) {
+          for(size_t j = 0; j < len; j++) {
+            if(!exif[offset + j]) break; // NULL terminator
+            std::cout << exif[offset + j];
+          }
+        } else if(format == 3) {
+          std::cout << readExifUint16(exif, size, offset, big_endian);
+        } else if(format == 4) {
+          if(tag_number == 34665) {
+            // TODO: this might miss sub IFDs if there are multiple
+            size_t sub_ifd = readExifUint32(exif, size, offset, big_endian);
+            if(sub_ifd != 0 && !seen.count(sub_ifd)) {
+              stack.push_back(sub_ifd);
+              seen[sub_ifd] = true;
+            }
+          }
+          else std::cout << readExifUint32(exif, size, offset, big_endian);
+        } else if(format == 5) {
+          double n = readExifUint32(exif, size, offset, big_endian);
+          double d = readExifUint32(exif, size, offset + 4, big_endian);
+          std::cout << (n / d);
+        } else if(format == 7 && len > 8 && exif[offset + 0] == 'A' && exif[offset + 1] == 'S' &&
+                  exif[offset + 2] == 'C' && exif[offset + 3] == 'I' && exif[offset + 4] == 'I') {
+          for(size_t j = 8; j < len; j++) std::cout << exif[offset + j];
+        } else if(format == 7 && len == 4 && tag_number == 36864) {
+          for(size_t j = 0; j < len; j++) std::cout << exif[offset + j];
+        } else if(format == 8) {
+          std::cout << (int32_t)readExifUint16(exif, size, offset, big_endian);
+        } else if(format == 9) {
+          std::cout << (int16_t)readExifUint32(exif, size, offset, big_endian);
+        } else if(format == 10) {
+          double n = (int32_t)readExifUint32(exif, size, offset, big_endian);
+          double d = (int32_t)readExifUint32(exif, size, offset + 4, big_endian);
+          std::cout << (n / d);
+        } else {
+          // Formats like double not handled here
+          std::cout << "[format " << format << ", len " << len << "]";
+        }
+        std::cout << std::endl;
+      }
+      if(pos + 4 > size) {
+        std::cout << "Error: EXIF IFD footer out of range" << std::endl;
+        return;
+      }
+
+      // if it's a sub, its next_ifd should be set to 0. It's ignored here.
+      if(!is_sub) next_ifd = readExifUint32(exif, size, pos, big_endian);
+
+      // any next one on the current stack is a SubIFD
+      is_sub = true;
+    }
+
+    // Handle next sequential IFD in the chain
+
+    if(next_ifd == 0 || seen.count(next_ifd)) break; // 0 indicates end of the chain
+
+    ifd_pos = next_ifd;
+    // next IFD's are not the main one, but a thumbnail (or other alternative)
+    is_thumbnail = true;
   }
 }
 
@@ -1406,7 +1440,7 @@ void showExif(Data& data) {
     return;
   }
   size_t ifd = readExifUint32(exif, size, 4, big_endian);
-  showExifIFD(exif, size, ifd, big_endian, false, false);
+  showExifIFD(exif, size, ifd, big_endian);
 }
 
 void showRender(Data& data, const Options& options) {
